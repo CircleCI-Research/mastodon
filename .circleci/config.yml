@@ -1,0 +1,117 @@
+version: 2.1
+
+# ---------------------------------------------------------------------------
+# Setup (dynamic config) pipeline.
+#
+# GitHub Actions gives every workflow its own `on.<event>.paths:` filter, so a
+# CSS-only change runs `lint-css` and nothing else. CircleCI has no native
+# per-workflow path filter, so we emulate it: this setup pipeline diffs the
+# changed files, turns them into pipeline parameters, and continues into
+# `.circleci/continue-config.yml`, whose workflows are gated on those
+# parameters.
+#
+# IMPORTANT CONTRACT: every parameter name emitted by the `mapping` below MUST
+# be declared under `parameters:` in `.circleci/continue-config.yml`, with a
+# `false` default. The path-filtering orb only emits parameters whose mapping
+# line matched a changed file -- unmatched parameters are absent from the
+# continuation payload entirely, so the continuation config's defaults are what
+# make "nothing changed" mean "do not run". Nothing in the CircleCI toolchain
+# checks this contract; see `.circleci/bin/check-parameter-contract.py`.
+#
+# Mapping syntax is `<path-regex> <parameter-name> <parameter-value>`. The orb
+# anchors each regex as `^<path-regex>$` against repo-relative paths, and
+# tokenises lines on whitespace -- so regexes may not contain spaces.
+#
+# Required project-level environment variables / contexts:
+#   CODECOV_TOKEN            - used by the `test-ruby` job's coverage upload.
+#   CHROMATIC_PROJECT_TOKEN  - used by the `chromatic` job.
+# Both are also documented at their point of use in the continuation config.
+# ---------------------------------------------------------------------------
+
+setup: true
+
+orbs:
+  path-filtering: circleci/path-filtering@2.0.0
+
+workflows:
+  setup:
+    jobs:
+      - path-filtering/filter:
+          name: detect-changes
+          base-revision: main
+          config-path: .circleci/continue-config.yml
+          mapping: |
+            # --- Ruby linting: rubocop + brakeman -------------------------
+            # Source: .github/workflows/lint-ruby.yml
+            Gemfile.*                                run-lint-ruby        true
+            \.rubocop.*\.yml                         run-lint-ruby        true
+            \.ruby-version                           run-lint-ruby        true
+            bin/rubocop                              run-lint-ruby        true
+            .*\.rb                                   run-lint-ruby        true
+            .*\.rake                                 run-lint-ruby        true
+            \.circleci/.*                            run-lint-ruby        true
+
+            # --- Haml linting ---------------------------------------------
+            # Source: .github/workflows/lint-haml.yml
+            \.haml-lint.*\.yml                       run-lint-haml        true
+            \.rubocop.*\.yml                         run-lint-haml        true
+            \.ruby-version                           run-lint-haml        true
+            .*\.haml                                 run-lint-haml        true
+            Gemfile.*                                run-lint-haml        true
+            \.circleci/.*                            run-lint-haml        true
+
+            # --- JavaScript linting: eslint + tsc -------------------------
+            # Source: .github/workflows/lint-js.yml
+            package\.json                            run-lint-js          true
+            yarn\.lock                               run-lint-js          true
+            tsconfig\.json                           run-lint-js          true
+            \.nvmrc                                  run-lint-js          true
+            eslint\.config\.mjs                      run-lint-js          true
+            .*\.(js|jsx|ts|tsx)                      run-lint-js          true
+            \.circleci/.*                            run-lint-js          true
+
+            # --- CSS linting ----------------------------------------------
+            # Source: .github/workflows/lint-css.yml
+            package\.json                            run-lint-css         true
+            yarn\.lock                               run-lint-css         true
+            \.nvmrc                                  run-lint-css         true
+            stylelint\.config\.js                    run-lint-css         true
+            .*\.(css|scss)                           run-lint-css         true
+            \.circleci/.*                            run-lint-css         true
+
+            # --- JavaScript testing ---------------------------------------
+            # Source: .github/workflows/test-js.yml
+            package\.json                            run-test-js          true
+            yarn\.lock                               run-test-js          true
+            \.nvmrc                                  run-test-js          true
+            .*\.(js|jsx|ts|tsx|snap)                 run-test-js          true
+            \.circleci/.*                            run-test-js          true
+
+            # --- Historical data migration testing ------------------------
+            # Source: .github/workflows/test-migrations.yml
+            Gemfile.*                                run-test-migrations  true
+            \.ruby-version                           run-test-migrations  true
+            .*\.rb                                   run-test-migrations  true
+            lib/tasks/tests\.rake                    run-test-migrations  true
+            lib/tasks/db\.rake                       run-test-migrations  true
+            \.circleci/.*                            run-test-migrations  true
+
+            # --- Bundler audit --------------------------------------------
+            # Source: .github/workflows/bundler-audit.yml
+            Gemfile.*                                run-bundler-audit    true
+            \.ruby-version                           run-bundler-audit    true
+            \.circleci/.*                            run-bundler-audit    true
+
+            # --- Container image build smoke test -------------------------
+            # Source: .github/workflows/test-image-build.yml
+            Dockerfile                               run-image-build      true
+            streaming/Dockerfile                     run-image-build      true
+            \.dockerignore                           run-image-build      true
+            \.circleci/.*                            run-image-build      true
+
+            # --- Chromatic visual regression ------------------------------
+            # Source: .github/workflows/chromatic.yml (its `pathcheck` job)
+            package\.json                            run-chromatic        true
+            yarn\.lock                               run-chromatic        true
+            .*\.(js|jsx|ts|tsx|css|scss)             run-chromatic        true
+            \.circleci/.*                            run-chromatic        true

@@ -1,0 +1,990 @@
+version: 2.1
+
+# ---------------------------------------------------------------------------
+# Continuation pipeline.
+#
+# Reached from `.circleci/config.yml` (the setup pipeline) via the
+# path-filtering orb. Each `run-*` parameter below corresponds 1:1 to a
+# parameter name emitted by that file's `mapping`, and defaults to `false` so
+# that "the orb did not emit it" means "that source workflow's path filter did
+# not match".
+#
+# Required project-level environment variables:
+#   CODECOV_TOKEN            coverage upload in `test-ruby-default`
+#   CHROMATIC_PROJECT_TOKEN  visual regression upload in `chromatic`
+# ---------------------------------------------------------------------------
+
+parameters:
+  # --- Emitted by the setup pipeline's path-filtering mapping --------------
+  run-lint-ruby:
+    type: boolean
+    default: false
+  run-lint-haml:
+    type: boolean
+    default: false
+  run-lint-js:
+    type: boolean
+    default: false
+  run-lint-css:
+    type: boolean
+    default: false
+  run-test-js:
+    type: boolean
+    default: false
+  run-test-migrations:
+    type: boolean
+    default: false
+  run-bundler-audit:
+    type: boolean
+    default: false
+  run-image-build:
+    type: boolean
+    default: false
+  run-chromatic:
+    type: boolean
+    default: false
+
+  # --- Not emitted by the mapping; constants for the whole pipeline --------
+  # Mirrors `.ruby-version`. `.circleci/bin/check-parameter-contract.py`
+  # asserts these two stay in sync.
+  default-ruby-version:
+    type: string
+    default: '4.0.6'
+  # Mirrors `.nvmrc`.
+  node-version:
+    type: string
+    default: '24.19'
+  # Flags for the asset tarball handed from `build-assets` to the test jobs.
+  # Contains characters that are special to both YAML and the shell (braces,
+  # double quotes, glob stars); kept as a parameter specifically so the
+  # compiled output can be diffed against this literal.
+  asset-archive-exclude:
+    type: string
+    default: '--exclude={"*.br","*.gz"}'
+
+# ---------------------------------------------------------------------------
+# Executors
+# ---------------------------------------------------------------------------
+
+executors:
+  # Ruby + Node. Replaces `runs-on: ubuntu-latest` plus the repo's
+  # `.github/actions/setup-ruby` composite action.
+  ruby:
+    parameters:
+      ruby-version:
+        type: string
+    docker:
+      - image: cimg/ruby:<< parameters.ruby-version >>-node
+    resource_class: large
+
+  # Ruby + Node with the Postgres and Redis service containers. Replaces the
+  # GitHub Actions `services:` block. Readiness is handled by
+  # `.circleci/bin/wait-for-services.sh`, not by container healthchecks.
+  ruby-with-db:
+    parameters:
+      ruby-version:
+        type: string
+      postgres-version:
+        type: string
+        default: '14-alpine'
+    docker:
+      - image: cimg/ruby:<< parameters.ruby-version >>-node
+      # The official Docker Hub images, exactly as upstream uses. `cimg/*`
+      # equivalents are deliberately not used: cimg/postgres publishes no
+      # `-alpine` tags, so `cimg/postgres:14-alpine` would not resolve.
+      - image: postgres:<< parameters.postgres-version >>
+        environment:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+      - image: redis:7-alpine
+    resource_class: large
+
+  # As above, plus an Elasticsearch service container.
+  ruby-with-elasticsearch:
+    parameters:
+      ruby-version:
+        type: string
+      search-image:
+        type: string
+    docker:
+      - image: cimg/ruby:<< parameters.ruby-version >>-node
+      - image: postgres:14-alpine
+        environment:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+      - image: redis:7-alpine
+      - image: << parameters.search-image >>
+        environment:
+          discovery.type: single-node
+          xpack.security.enabled: false
+    resource_class: large
+
+  # As above, but OpenSearch, which rejects the `xpack.*` settings that
+  # Elasticsearch requires -- hence a separate executor rather than one
+  # parameterised image with a union of both environments.
+  ruby-with-opensearch:
+    parameters:
+      ruby-version:
+        type: string
+      search-image:
+        type: string
+    docker:
+      - image: cimg/ruby:<< parameters.ruby-version >>-node
+      - image: postgres:14-alpine
+        environment:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: postgres
+      - image: redis:7-alpine
+      - image: << parameters.search-image >>
+        environment:
+          discovery.type: single-node
+          DISABLE_INSTALL_DEMO_CONFIG: true
+          DISABLE_SECURITY_PLUGIN: true
+    resource_class: large
+
+  # Node only. Replaces `.github/actions/setup-javascript` on its own.
+  node:
+    docker:
+      - image: cimg/node:<< pipeline.parameters.node-version >>
+    resource_class: large
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+commands:
+  install-system-dependencies:
+    description: >
+      Port of the "Install system dependencies" step of
+      .github/workflows/../actions/setup-ruby/action.yml. The upstream step
+      also rewrites /etc/apt/apt-mirrors.txt to work around GitHub's Azure
+      apt mirrors; that file does not exist on CircleCI images, so it is
+      omitted.
+    parameters:
+      additional-packages:
+        type: string
+        default: ''
+    steps:
+      - run:
+          name: Install system dependencies
+          command: |
+            sudo apt-get update
+            sudo apt-get install --no-install-recommends -y \
+              libicu-dev \
+              libidn11-dev \
+              libvips42 \
+              libheif-plugin-aomdec \
+              libheif-plugin-libde265 \
+              << parameters.additional-packages >>
+
+  bundle-install:
+    description: >
+      Port of `ruby/setup-ruby` with `bundler-cache: true`. The cache key
+      includes the Ruby version because compiled native extensions are not
+      portable between Ruby ABI versions.
+    parameters:
+      ruby-version:
+        type: string
+      cache-namespace:
+        type: string
+    steps:
+      - run:
+          name: Configure bundler path
+          command: bundle config set --local path vendor/bundle
+      - restore_cache:
+          keys:
+            - bundle-v1-<< parameters.cache-namespace >>-<< parameters.ruby-version >>-{{ checksum "Gemfile.lock" }}
+            - bundle-v1-<< parameters.cache-namespace >>-<< parameters.ruby-version >>-
+      - run:
+          name: Install Ruby dependencies
+          command: bundle install --jobs 3 --retry 3
+      - save_cache:
+          key: bundle-v1-<< parameters.cache-namespace >>-<< parameters.ruby-version >>-{{ checksum "Gemfile.lock" }}
+          paths:
+            - vendor/bundle
+
+  setup-javascript:
+    description: >
+      Port of .github/actions/setup-javascript/action.yml. `onlyProduction`
+      becomes the `only-production` parameter.
+    parameters:
+      only-production:
+        type: boolean
+        default: false
+    steps:
+      - run:
+          name: Enable corepack
+          # Upstream runs a bare `npm i -g corepack`. Whether that needs sudo
+          # depends on how Node was installed in the image (nvm-owned prefix
+          # vs. /usr/local), which differs between cimg/node and
+          # cimg/ruby:*-node, so both are attempted.
+          command: |
+            npm i -g corepack@latest || sudo npm i -g corepack@latest
+            corepack enable || sudo corepack enable
+            yarn --version
+      - restore_cache:
+          keys:
+            - yarn-v1-{{ checksum "yarn.lock" }}
+            - yarn-v1-
+      - when:
+          condition: << parameters.only-production >>
+          steps:
+            - run:
+                name: Install production yarn packages
+                command: yarn workspaces focus --production
+      - unless:
+          condition: << parameters.only-production >>
+          steps:
+            - run:
+                name: Install all yarn packages
+                command: yarn install --immutable
+      - save_cache:
+          key: yarn-v1-{{ checksum "yarn.lock" }}
+          paths:
+            - ~/.yarn/berry/cache
+
+  wait-for-database:
+    description: Replaces the GitHub Actions service-container healthchecks.
+    steps:
+      - run:
+          name: Wait for Postgres and Redis
+          command: .circleci/bin/wait-for-services.sh tcp:localhost:5432 tcp:localhost:6379
+
+  wait-for-search:
+    description: Replaces the GitHub Actions service-container healthchecks.
+    steps:
+      - run:
+          name: Wait for Postgres, Redis and the search cluster
+          command: |
+            .circleci/bin/wait-for-services.sh \
+              tcp:localhost:5432 \
+              tcp:localhost:6379 \
+              http:http://localhost:9200/_cluster/health
+
+  restore-asset-artifacts:
+    description: >
+      Replaces `actions/download-artifact` + the "Expand archived asset
+      artifacts" step. Must run before anything that reads public/assets.
+
+      DELIBERATE DEVIATION: upstream's `test-search` job downloads the
+      artifact but never expands it, so the tarball sits unused. That looks
+      like an oversight rather than intent, so this command expands it in
+      every consumer, `test-search` included.
+    steps:
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Expand archived asset artifacts
+          command: tar xvzf /tmp/workspace/artifacts.tar.gz
+
+# ---------------------------------------------------------------------------
+# Jobs
+# ---------------------------------------------------------------------------
+
+jobs:
+  # === .github/workflows/lint-ruby.yml : lint ==============================
+  lint-ruby:
+    executor:
+      name: ruby
+      ruby-version: << pipeline.parameters.default-ruby-version >>
+    environment:
+      BUNDLE_ONLY: development
+    steps:
+      - checkout
+      - install-system-dependencies
+      - bundle-install:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
+          cache-namespace: development
+      - run:
+          name: Run rubocop
+          command: bin/rubocop --format progress
+      - run:
+          name: Run brakeman
+          # Upstream uses `if: always()` so both checks report even when the
+          # first one fails.
+          when: always
+          command: bin/brakeman
+
+  # === .github/workflows/lint-haml.yml : lint ==============================
+  lint-haml:
+    executor:
+      name: ruby
+      ruby-version: << pipeline.parameters.default-ruby-version >>
+    environment:
+      BUNDLE_ONLY: development
+    steps:
+      - checkout
+      - install-system-dependencies
+      - bundle-install:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
+          cache-namespace: development
+      - run:
+          name: Run haml-lint
+          command: bin/haml-lint
+
+  # === .github/workflows/bundler-audit.yml : security ======================
+  bundler-audit:
+    executor:
+      name: ruby
+      ruby-version: << pipeline.parameters.default-ruby-version >>
+    environment:
+      BUNDLE_ONLY: development
+    steps:
+      - checkout
+      - install-system-dependencies
+      - bundle-install:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
+          cache-namespace: development
+      - run:
+          name: Run bundler-audit
+          command: bin/bundler-audit check --update
+
+  # === .github/workflows/lint-js.yml : lint ================================
+  lint-js:
+    executor: node
+    steps:
+      - checkout
+      - setup-javascript
+      - run:
+          name: ESLint
+          command: yarn workspaces foreach --all --parallel run lint:js --max-warnings 0
+      - run:
+          name: Typecheck
+          command: yarn typecheck
+
+  # === .github/workflows/lint-css.yml : lint ===============================
+  lint-css:
+    executor: node
+    steps:
+      - checkout
+      - setup-javascript
+      - run:
+          name: Stylelint
+          command: yarn lint:css
+
+  # === .github/workflows/format-check.yml : lint ===========================
+  format-check:
+    executor: node
+    steps:
+      - checkout
+      - setup-javascript
+      - run:
+          name: Check formatting
+          command: yarn format:check
+
+  # === .github/workflows/test-js.yml : test ================================
+  test-js:
+    executor: node
+    steps:
+      - checkout
+      - setup-javascript
+      - run:
+          name: JavaScript testing
+          command: yarn test:js
+
+  # === .github/workflows/check-i18n.yml : check-i18n =======================
+  check-i18n:
+    executor:
+      name: ruby
+      ruby-version: << pipeline.parameters.default-ruby-version >>
+    environment:
+      RAILS_ENV: test
+    steps:
+      - checkout
+      - install-system-dependencies
+      - bundle-install:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
+          cache-namespace: default
+      - setup-javascript
+      - run:
+          name: Check for missing strings in English JSON
+          command: |
+            yarn i18n:extract --throws
+            git diff --exit-code
+      - run:
+          name: Check locale file normalization
+          command: bin/i18n-tasks check-normalized
+      - run:
+          name: Check for unused strings
+          command: bin/i18n-tasks unused -l en
+      - run:
+          name: Check for missing strings in English YML
+          command: bin/i18n-tasks missing -t used -l en
+      - run:
+          name: Check for wrong string interpolations
+          command: bin/i18n-tasks check-consistent-interpolations
+      - run:
+          name: Check that all required locale files exist
+          command: bin/rake repo:check_locales_files
+
+  # === .github/workflows/test-ruby.yml : build =============================
+  build-assets:
+    parameters:
+      mode:
+        type: string
+      persist-assets:
+        type: boolean
+        default: false
+    executor:
+      name: ruby
+      ruby-version: << pipeline.parameters.default-ruby-version >>
+    environment:
+      BUNDLE_CLEAN: true
+      BUNDLE_FROZEN: true
+      RAILS_ENV: << parameters.mode >>
+      BUNDLE_WITH: << parameters.mode >>
+      SECRET_KEY_BASE_DUMMY: 1
+    steps:
+      - checkout
+      - install-system-dependencies
+      - bundle-install:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
+          cache-namespace: << parameters.mode >>
+      - setup-javascript:
+          only-production: true
+      - restore_cache:
+          keys:
+            - << parameters.mode >>-assets-v1-{{ .Branch }}-{{ .Revision }}
+            - << parameters.mode >>-assets-v1-{{ .Branch }}-
+            - << parameters.mode >>-assets-v1-main-
+            - << parameters.mode >>-assets-v1-
+      - run:
+          name: Precompile assets
+          command: bin/rails assets:precompile
+      - save_cache:
+          key: << parameters.mode >>-assets-v1-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - public/assets
+            - public/packs
+            - public/packs-test
+            - tmp/cache/vite
+      - run:
+          name: Archive asset artifacts
+          command: tar << pipeline.parameters.asset-archive-exclude >> -zcf artifacts.tar.gz public/assets public/packs*
+      # Upstream only uploads the artifact for the `test` matrix leg; the
+      # `production` leg exists purely to prove `assets:precompile` works.
+      - when:
+          condition: << parameters.persist-assets >>
+          steps:
+            - persist_to_workspace:
+                root: .
+                paths:
+                  - artifacts.tar.gz
+
+  # === .github/workflows/test-ruby.yml : test ==============================
+  test-ruby:
+    parameters:
+      ruby-version:
+        type: string
+      # String rather than boolean so it can be interpolated into an env var
+      # exactly as GitHub Actions does ("true" / "false").
+      coverage:
+        type: string
+        default: 'false'
+    executor:
+      name: ruby-with-db
+      ruby-version: << parameters.ruby-version >>
+    environment:
+      DB_HOST: localhost
+      DB_USER: postgres
+      DB_PASS: postgres
+      COVERAGE: << parameters.coverage >>
+      RAILS_ENV: test
+      ALLOW_NOPAM: true
+      PAM_ENABLED: true
+      PAM_DEFAULT_SERVICE: pam_test
+      PAM_CONTROLLED_SERVICE: pam_test_controlled
+      OIDC_ENABLED: true
+      OIDC_SCOPE: read
+      SAML_ENABLED: true
+      CAS_ENABLED: true
+      BUNDLE_WITH: 'pam_authentication test'
+    steps:
+      - checkout
+      - restore-asset-artifacts
+      - install-system-dependencies:
+          additional-packages: ffmpeg libpam-dev
+      - bundle-install:
+          ruby-version: << parameters.ruby-version >>
+          cache-namespace: pam-test
+      - wait-for-database
+      - run:
+          name: Load database schema
+          command: |
+            bin/rails db:setup
+            bin/flatware fan bin/rails db:test:prepare
+      - restore_cache:
+          keys:
+            - rspec-persistence-v1-<< parameters.ruby-version >>-{{ .Branch }}-{{ .Revision }}
+            - rspec-persistence-v1-<< parameters.ruby-version >>-{{ .Branch }}-
+            - rspec-persistence-v1-<< parameters.ruby-version >>-main-
+            - rspec-persistence-v1-<< parameters.ruby-version >>-
+      - run:
+          name: Run RSpec
+          command: bin/flatware rspec
+      - save_cache:
+          key: rspec-persistence-v1-<< parameters.ruby-version >>-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - tmp/rspec/examples.txt
+      - when:
+          condition:
+            equal: ['true', << parameters.coverage >>]
+          steps:
+            - run:
+                name: Upload coverage reports to Codecov
+                # Replaces codecov/codecov-action. The Codecov orb is an
+                # uncertified public orb and will not resolve unless the org
+                # opts in, so the CLI is invoked directly.
+                # Requires CODECOV_TOKEN in the project environment.
+                command: |
+                  codecov_files=()
+                  for lcov in coverage/lcov/*.lcov; do
+                    [ -e "$lcov" ] || continue
+                    codecov_files+=(--file "$lcov")
+                  done
+                  if [ "${#codecov_files[@]}" -eq 0 ]; then
+                    # codecov/codecov-action defaults to fail_ci_if_error:
+                    # false, so a missing report must not fail the job.
+                    echo "No lcov reports under coverage/lcov; skipping upload."
+                    exit 0
+                  fi
+                  curl --silent --show-error --fail --location \
+                    --output /tmp/codecov https://cli.codecov.io/latest/linux/codecov
+                  chmod +x /tmp/codecov
+                  /tmp/codecov upload-process --disable-search "${codecov_files[@]}"
+            - store_artifacts:
+                path: coverage
+      - store_artifacts:
+          path: log
+          destination: rspec-logs
+          when: on_fail
+
+  # === .github/workflows/test-ruby.yml : test-e2e ==========================
+  test-e2e:
+    parameters:
+      ruby-version:
+        type: string
+    executor:
+      name: ruby-with-db
+      ruby-version: << parameters.ruby-version >>
+    environment:
+      DB_HOST: localhost
+      DB_USER: postgres
+      DB_PASS: postgres
+      RAILS_ENV: test
+      BUNDLE_WITH: test
+      LOCAL_DOMAIN: localhost:3000
+      LOCAL_HTTPS: false
+    steps:
+      - checkout
+      - restore-asset-artifacts
+      - install-system-dependencies:
+          additional-packages: ffmpeg
+      - bundle-install:
+          ruby-version: << parameters.ruby-version >>
+          cache-namespace: test
+      - setup-javascript
+      - wait-for-database
+      - run:
+          name: Load database schema
+          command: ./bin/rails db:create db:schema:load db:seed
+      - restore_cache:
+          keys:
+            - playwright-browsers-v1-{{ arch }}-{{ checksum "yarn.lock" }}
+      - run:
+          name: Install Playwright Chromium browser
+          # Upstream splits this across two steps keyed on the cache-hit
+          # output of actions/cache. CircleCI's restore_cache exposes no such
+          # output, so the presence of the browser directory is the signal.
+          command: |
+            if [ -d "$HOME/.cache/ms-playwright" ]; then
+              yarn run playwright install-deps chromium
+            else
+              yarn run playwright install --with-deps chromium
+            fi
+      - save_cache:
+          key: playwright-browsers-v1-{{ arch }}-{{ checksum "yarn.lock" }}
+          paths:
+            - ~/.cache/ms-playwright
+      - run:
+          name: Run end-to-end tests
+          command: bin/rspec spec/system --tag streaming --tag js
+      # Upstream guards both uploads with `if: failure()`.
+      - store_artifacts:
+          path: log
+          destination: e2e-logs-<< parameters.ruby-version >>
+          when: on_fail
+      - store_artifacts:
+          path: tmp/capybara
+          destination: e2e-screenshots-<< parameters.ruby-version >>
+          when: on_fail
+
+  # === .github/workflows/test-ruby.yml : test-search =======================
+  test-search-elasticsearch:
+    parameters:
+      ruby-version:
+        type: string
+      search-image:
+        type: string
+    executor:
+      name: ruby-with-elasticsearch
+      ruby-version: << parameters.ruby-version >>
+      search-image: << parameters.search-image >>
+    environment:
+      DB_HOST: localhost
+      DB_USER: postgres
+      DB_PASS: postgres
+      RAILS_ENV: test
+      BUNDLE_WITH: test
+      ES_ENABLED: true
+      ES_HOST: localhost
+      ES_PORT: 9200
+    steps:
+      - checkout
+      - restore-asset-artifacts
+      - install-system-dependencies:
+          additional-packages: ffmpeg
+      - bundle-install:
+          ruby-version: << parameters.ruby-version >>
+          cache-namespace: test
+      - setup-javascript
+      - wait-for-search
+      - run:
+          name: Load database schema
+          command: ./bin/rails db:create db:schema:load db:seed
+      - run:
+          name: Run search integration tests
+          command: bin/rspec --tag search
+      - store_artifacts:
+          path: log
+          destination: test-search-logs-<< parameters.ruby-version >>
+          when: on_fail
+
+  test-search-opensearch:
+    parameters:
+      ruby-version:
+        type: string
+      search-image:
+        type: string
+    executor:
+      name: ruby-with-opensearch
+      ruby-version: << parameters.ruby-version >>
+      search-image: << parameters.search-image >>
+    environment:
+      DB_HOST: localhost
+      DB_USER: postgres
+      DB_PASS: postgres
+      RAILS_ENV: test
+      BUNDLE_WITH: test
+      ES_ENABLED: true
+      ES_HOST: localhost
+      ES_PORT: 9200
+    steps:
+      - checkout
+      - restore-asset-artifacts
+      - install-system-dependencies:
+          additional-packages: ffmpeg
+      - bundle-install:
+          ruby-version: << parameters.ruby-version >>
+          cache-namespace: test
+      - setup-javascript
+      - wait-for-search
+      - run:
+          name: Load database schema
+          command: ./bin/rails db:create db:schema:load db:seed
+      - run:
+          name: Run search integration tests
+          command: bin/rspec --tag search
+      - store_artifacts:
+          path: log
+          destination: test-search-logs-<< parameters.ruby-version >>
+          when: on_fail
+
+  # === .github/workflows/test-migrations.yml : test ========================
+  test-migrations:
+    parameters:
+      postgres-version:
+        type: string
+    executor:
+      name: ruby-with-db
+      ruby-version: << pipeline.parameters.default-ruby-version >>
+      postgres-version: << parameters.postgres-version >>
+    environment:
+      DB_HOST: localhost
+      DB_USER: postgres
+      DB_PASS: postgres
+      RAILS_ENV: test
+      BUNDLE_CLEAN: true
+      BUNDLE_FROZEN: true
+      BUNDLE_WITHOUT: 'development:production'
+      BUNDLE_JOBS: 3
+      BUNDLE_RETRY: 3
+    steps:
+      - checkout
+      - install-system-dependencies
+      - bundle-install:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
+          cache-namespace: migrations
+      - wait-for-database
+      - run:
+          name: Ensure no errors with `db:prepare`
+          command: |
+            bin/rails db:drop
+            bin/rails db:prepare
+            bin/rails db:migrate
+      - run:
+          name: Ensure no errors with `db:prepare` and SKIP_POST_DEPLOYMENT_MIGRATIONS
+          command: |
+            bin/rails db:drop
+            SKIP_POST_DEPLOYMENT_MIGRATIONS=true bin/rails db:prepare
+            bin/rails db:migrate
+      - run:
+          name: Test "one step migration" flow
+          command: |
+            bin/rails db:drop
+            bin/rails db:create
+            bin/rails tests:migrations:prepare_database
+            bin/rails db:migrate
+            bin/rails tests:migrations:check_database
+      - run:
+          name: Test "two step migration" flow
+          command: |
+            bin/rails db:drop
+            bin/rails db:create
+            SKIP_POST_DEPLOYMENT_MIGRATIONS=true bin/rails tests:migrations:prepare_database
+
+            # Migrate up to v4.3.0 breakpoint
+            bin/rails db:migrate VERSION=20241007071624
+
+            # Migrate the rest
+            SKIP_POST_DEPLOYMENT_MIGRATIONS=true bin/rails db:migrate
+            bin/rails db:migrate
+            bin/rails tests:migrations:check_database
+
+  # === .github/workflows/build-container-image.yml : build-image ===========
+  # (as called by .github/workflows/test-image-build.yml -- build only, the
+  # `push_to_images` code paths are release publishing and out of scope)
+  build-image:
+    parameters:
+      dockerfile:
+        type: string
+      platform:
+        type: string
+      resource-class:
+        type: string
+    machine:
+      image: ubuntu-2404:current
+      docker_layer_caching: true
+    resource_class: << parameters.resource-class >>
+    steps:
+      - checkout
+      - run:
+          name: Set up Docker Buildx
+          # Equivalent of docker/setup-buildx-action. Required: the default
+          # `docker` buildx driver cannot honour `--output type=cacheonly`,
+          # only the `docker-container` driver can.
+          command: docker buildx create --use --driver docker-container --name mastodon-builder
+      - run:
+          name: Build << parameters.dockerfile >> for << parameters.platform >>
+          command: |
+            docker buildx build \
+              --file "<< parameters.dockerfile >>" \
+              --platform "<< parameters.platform >>" \
+              --provenance false \
+              --build-arg "SOURCE_COMMIT=${CIRCLE_SHA1}" \
+              --output type=cacheonly \
+              .
+
+  # === .github/workflows/chromatic.yml : chromatic =========================
+  chromatic:
+    executor: node
+    steps:
+      # Replaces `if: github.repository == 'mastodon/mastodon'`. MUST be the
+      # first step: everything after it assumes the job is allowed to run and
+      # that CHROMATIC_PROJECT_TOKEN is present.
+      - run:
+          name: Halt unless running on the canonical repository
+          command: |
+            if [ "${CIRCLE_PROJECT_USERNAME}/${CIRCLE_PROJECT_REPONAME}" != "mastodon/mastodon" ]; then
+              echo "Not the canonical mastodon/mastodon repository; skipping Chromatic."
+              circleci-agent step halt
+            fi
+      - checkout
+      - setup-javascript
+      - run:
+          name: Build Storybook
+          command: yarn build-storybook
+      - run:
+          name: Run Chromatic
+          # Replaces chromaui/action. Requires CHROMATIC_PROJECT_TOKEN.
+          # The `chromatic` package.json script already passes
+          # `-d storybook-static`, so the build dir is not repeated here.
+          command: |
+            yarn chromatic \
+              --project-token "${CHROMATIC_PROJECT_TOKEN}" \
+              --zip \
+              --exit-once-uploaded \
+              --auto-accept-changes main
+
+# ---------------------------------------------------------------------------
+# Workflows
+# ---------------------------------------------------------------------------
+
+workflows:
+  # --- Always-on: the source workflows with no `paths:` filter -------------
+
+  # Source: .github/workflows/test-ruby.yml
+  ruby-testing:
+    jobs:
+      - build-assets:
+          name: build-assets-production
+          mode: production
+      - build-assets:
+          name: build-assets-test
+          mode: test
+          persist-assets: true
+
+      - test-ruby:
+          name: test-ruby-<< matrix.ruby-version >>
+          matrix:
+            parameters:
+              ruby-version: ['3.3', '3.4']
+          requires:
+            - build-assets-test
+      - test-ruby:
+          name: test-ruby-default
+          ruby-version: << pipeline.parameters.default-ruby-version >>
+          coverage: 'true'
+          requires:
+            - build-assets-test
+
+      - test-e2e:
+          name: test-e2e-<< matrix.ruby-version >>
+          matrix:
+            parameters:
+              ruby-version:
+                ['3.3', '3.4', << pipeline.parameters.default-ruby-version >>]
+          requires:
+            - build-assets-test
+
+      # Upstream matrix: ruby x [es 7.17.29], plus two `include:` legs that
+      # CircleCI matrices cannot express, so all five are listed explicitly.
+      - test-search-elasticsearch:
+          name: test-search-es7-<< matrix.ruby-version >>
+          matrix:
+            parameters:
+              ruby-version:
+                ['3.3', '3.4', << pipeline.parameters.default-ruby-version >>]
+              search-image:
+                ['docker.elastic.co/elasticsearch/elasticsearch:7.17.29']
+          requires:
+            - build-assets-test
+      - test-search-elasticsearch:
+          name: test-search-es8-default
+          ruby-version: << pipeline.parameters.default-ruby-version >>
+          search-image: 'docker.elastic.co/elasticsearch/elasticsearch:8.19.2'
+          requires:
+            - build-assets-test
+      - test-search-opensearch:
+          name: test-search-opensearch2-default
+          ruby-version: << pipeline.parameters.default-ruby-version >>
+          search-image: 'opensearchproject/opensearch:2'
+          requires:
+            - build-assets-test
+
+  # Source: .github/workflows/format-check.yml
+  formatting:
+    jobs:
+      - format-check
+
+  # Source: .github/workflows/check-i18n.yml
+  i18n:
+    jobs:
+      - check-i18n
+
+  # --- Path-gated: mirror each source workflow's `paths:` filter -----------
+
+  # Source: .github/workflows/lint-ruby.yml
+  ruby-linting:
+    when: << pipeline.parameters.run-lint-ruby >>
+    jobs:
+      - lint-ruby
+
+  # Source: .github/workflows/lint-haml.yml
+  haml-linting:
+    when: << pipeline.parameters.run-lint-haml >>
+    jobs:
+      - lint-haml
+
+  # Source: .github/workflows/lint-js.yml
+  javascript-linting:
+    when: << pipeline.parameters.run-lint-js >>
+    jobs:
+      - lint-js
+
+  # Source: .github/workflows/lint-css.yml
+  css-linting:
+    when: << pipeline.parameters.run-lint-css >>
+    jobs:
+      - lint-css
+
+  # Source: .github/workflows/test-js.yml
+  javascript-testing:
+    when: << pipeline.parameters.run-test-js >>
+    jobs:
+      - test-js
+
+  # Source: .github/workflows/bundler-audit.yml
+  bundler-audit:
+    when: << pipeline.parameters.run-bundler-audit >>
+    jobs:
+      - bundler-audit
+
+  # Source: .github/workflows/test-migrations.yml
+  migration-testing:
+    when: << pipeline.parameters.run-test-migrations >>
+    jobs:
+      - test-migrations:
+          name: test-migrations-postgres-<< matrix.postgres-version >>
+          matrix:
+            parameters:
+              postgres-version: ['14-alpine', '15-alpine', '16-alpine', '17-alpine']
+
+  # Source: .github/workflows/test-image-build.yml
+  container-image-build:
+    when: << pipeline.parameters.run-image-build >>
+    jobs:
+      - build-image:
+          name: build-image-amd64
+          dockerfile: Dockerfile
+          platform: linux/amd64
+          resource-class: large
+      - build-image:
+          name: build-image-arm64
+          dockerfile: Dockerfile
+          platform: linux/arm64
+          resource-class: arm.large
+      - build-image:
+          name: build-image-streaming-amd64
+          dockerfile: streaming/Dockerfile
+          platform: linux/amd64
+          resource-class: large
+      - build-image:
+          name: build-image-streaming-arm64
+          dockerfile: streaming/Dockerfile
+          platform: linux/arm64
+          resource-class: arm.large
+
+  # Source: .github/workflows/chromatic.yml
+  visual-regression:
+    when: << pipeline.parameters.run-chromatic >>
+    jobs:
+      - chromatic:
+          filters:
+            branches:
+              ignore:
+                - /^renovate\/.*/
+                - /^stable-.*/
