@@ -176,9 +176,19 @@ commands:
               libicu-dev \
               libidn11-dev \
               libvips42 \
-              libheif-plugin-aomdec \
-              libheif-plugin-libde265 \
               << parameters.additional-packages >>
+            # Ubuntu split libheif's decoders into separate plugin packages in
+            # 24.04. The upstream action installs them unconditionally because
+            # ubuntu-latest is 24.04, but the ruby images in this matrix do not
+            # share one base: cimg/ruby:3.3 and :3.4 are still jammy, where the
+            # same decoders ship inside libheif1 (already pulled in by
+            # libvips42) and these package names do not resolve at all. That is
+            # why every 3.3/3.4 leg failed here while the 4.0.6 legs passed.
+            if apt-cache show libheif-plugin-aomdec >/dev/null 2>&1; then
+              sudo apt-get install --no-install-recommends -y \
+                libheif-plugin-aomdec \
+                libheif-plugin-libde265
+            fi
 
   bundle-install:
     description: >
@@ -951,7 +961,8 @@ workflows:
           name: test-migrations-postgres-<< matrix.postgres-version >>
           matrix:
             parameters:
-              postgres-version: ['14-alpine', '15-alpine', '16-alpine', '17-alpine']
+              postgres-version:
+                ['14-alpine', '15-alpine', '16-alpine', '17-alpine']
 
   # Source: .github/workflows/test-image-build.yml
   container-image-build:
