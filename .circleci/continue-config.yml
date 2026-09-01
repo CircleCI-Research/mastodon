@@ -256,7 +256,13 @@ commands:
     description: >
       Port of `ruby/setup-ruby` with `bundler-cache: true`. The cache key
       includes the Ruby version because compiled native extensions are not
-      portable between Ruby ABI versions.
+      portable between Ruby ABI versions, AND a fingerprint of the base image
+      because they are not portable between OS releases either. Keying on Ruby
+      alone let a jammy-built charlock_holmes restore onto a noble container,
+      which failed with "libicudata.so.70: cannot open shared object file" --
+      jammy carries ICU 70 and noble carries ICU 74. Any change of base image
+      silently invalidates every native gem in the cache while the key stays
+      the same.
     parameters:
       ruby-version:
         type: string
@@ -264,17 +270,22 @@ commands:
         type: string
     steps:
       - run:
-          name: Configure bundler path
-          command: bundle config set --local path vendor/bundle
+          name: Configure bundler path and fingerprint the base image
+          command: |
+            bundle config set --local path vendor/bundle
+            # Written before restore_cache so its checksum can key the cache on
+            # the OS the native extensions were built against.
+            . /etc/os-release
+            echo "${ID}-${VERSION_ID}" | tee /tmp/os-fingerprint
       - restore_cache:
           keys:
-            - bundle-v1-<< parameters.cache-namespace >>-<< parameters.ruby-version >>-{{ checksum "Gemfile.lock" }}
-            - bundle-v1-<< parameters.cache-namespace >>-<< parameters.ruby-version >>-
+            - bundle-v2-{{ checksum "/tmp/os-fingerprint" }}-<< parameters.cache-namespace >>-<< parameters.ruby-version >>-{{ checksum "Gemfile.lock" }}
+            - bundle-v2-{{ checksum "/tmp/os-fingerprint" }}-<< parameters.cache-namespace >>-<< parameters.ruby-version >>-
       - run:
           name: Install Ruby dependencies
           command: bundle install --jobs 3 --retry 3
       - save_cache:
-          key: bundle-v1-<< parameters.cache-namespace >>-<< parameters.ruby-version >>-{{ checksum "Gemfile.lock" }}
+          key: bundle-v2-{{ checksum "/tmp/os-fingerprint" }}-<< parameters.cache-namespace >>-<< parameters.ruby-version >>-{{ checksum "Gemfile.lock" }}
           paths:
             - vendor/bundle
 
