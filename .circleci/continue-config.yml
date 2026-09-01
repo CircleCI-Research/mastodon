@@ -185,11 +185,17 @@ commands:
               *)   ruby -v; echo "Using the image's Ruby"; exit 0 ;;
             esac
             url="https://github.com/ruby/ruby-builder/releases/download/ruby-${FULL}/ruby-${FULL}-ubuntu-24.04-x64.tar.gz"
-            sudo mkdir -p /opt/rubies
-            curl -fsSL "$url" | sudo tar -xz -C /opt/rubies
-            bindir="$(find /opt/rubies -maxdepth 3 -type d -name bin | head -1)"
-            if [ -z "$bindir" ]; then echo "no bin/ in the extracted tarball"; exit 1; fi
-            echo "export PATH=\"${bindir}:\$PATH\"" >> "$BASH_ENV"
+            # These tarballs are NOT relocatable: the interpreter is linked
+            # against a hardcoded prefix, so extracting anywhere else fails at
+            # first use with "libruby.so.<version>: cannot open shared object
+            # file". Use the exact prefix ruby/setup-ruby extracts to.
+            prefix="/opt/hostedtoolcache/Ruby/${FULL}/x64"
+            sudo mkdir -p "$prefix"
+            curl -fsSL "$url" | sudo tar -xz -C "$prefix"
+            if [ ! -x "$prefix/bin/ruby" ]; then
+              echo "no bin/ruby under $prefix after extraction"; exit 1
+            fi
+            echo "export PATH=\"$prefix/bin:\$PATH\"" >> "$BASH_ENV"
             # shellcheck disable=SC1090
             . "$BASH_ENV"
             ruby -v
