@@ -74,7 +74,7 @@ executors:
       ruby-version:
         type: string
     docker:
-      - image: cimg/ruby:<< parameters.ruby-version >>-node
+      - image: cimg/ruby:<< pipeline.parameters.default-ruby-version >>-node
     resource_class: large
 
   # Ruby + Node with the Postgres and Redis service containers. Replaces the
@@ -88,7 +88,7 @@ executors:
         type: string
         default: '14-alpine'
     docker:
-      - image: cimg/ruby:<< parameters.ruby-version >>-node
+      - image: cimg/ruby:<< pipeline.parameters.default-ruby-version >>-node
       # The official Docker Hub images, exactly as upstream uses. `cimg/*`
       # equivalents are deliberately not used: cimg/postgres publishes no
       # `-alpine` tags, so `cimg/postgres:14-alpine` would not resolve.
@@ -108,7 +108,7 @@ executors:
       search-image:
         type: string
     docker:
-      - image: cimg/ruby:<< parameters.ruby-version >>-node
+      - image: cimg/ruby:<< pipeline.parameters.default-ruby-version >>-node
       - image: postgres:14-alpine
         environment:
           POSTGRES_PASSWORD: postgres
@@ -131,7 +131,7 @@ executors:
       search-image:
         type: string
     docker:
-      - image: cimg/ruby:<< parameters.ruby-version >>-node
+      - image: cimg/ruby:<< pipeline.parameters.default-ruby-version >>-node
       - image: postgres:14-alpine
         environment:
           POSTGRES_PASSWORD: postgres
@@ -156,6 +156,44 @@ executors:
 # ---------------------------------------------------------------------------
 
 commands:
+  install-ruby:
+    description: >
+      Stand-in for `ruby/setup-ruby`, and the reason the executors above no
+      longer select their image by Ruby version. The source matrixes
+      ['3.3', '3.4', '.ruby-version'] onto one fixed ubuntu-latest runner, so
+      every leg shares an OS and only the interpreter changes. Choosing a
+      cimg/ruby:<version> image instead couples the two: cimg/ruby:3.3 and :3.4
+      are Ubuntu jammy, whose libvips is 8.12.1, while this application requires
+      >= 8.13 and there is no jammy backport. Those legs failed on an OS
+      difference the source does not have. The image is now pinned to the
+      .ruby-version build (noble, libvips 8.15) and the matrix interpreter is
+      laid over it from the same prebuilt tarballs setup-ruby downloads.
+    parameters:
+      ruby-version:
+        type: string
+    steps:
+      - run:
+          name: Install Ruby << parameters.ruby-version >>
+          environment:
+            WANTED: << parameters.ruby-version >>
+          command: |
+            # Only the matrix legs need a different interpreter; the
+            # .ruby-version leg already has it in the image.
+            case "$WANTED" in
+              3.3) FULL=3.3.12 ;;
+              3.4) FULL=3.4.10 ;;
+              *)   ruby -v; echo "Using the image's Ruby"; exit 0 ;;
+            esac
+            url="https://github.com/ruby/ruby-builder/releases/download/ruby-${FULL}/ruby-${FULL}-ubuntu-24.04-x64.tar.gz"
+            sudo mkdir -p /opt/rubies
+            curl -fsSL "$url" | sudo tar -xz -C /opt/rubies
+            bindir="$(find /opt/rubies -maxdepth 3 -type d -name bin | head -1)"
+            if [ -z "$bindir" ]; then echo "no bin/ in the extracted tarball"; exit 1; fi
+            echo "export PATH=\"${bindir}:\$PATH\"" >> "$BASH_ENV"
+            # shellcheck disable=SC1090
+            . "$BASH_ENV"
+            ruby -v
+            gem install bundler --no-document
   install-system-dependencies:
     description: >
       Port of the "Install system dependencies" step of
@@ -305,6 +343,8 @@ jobs:
     steps:
       - checkout
       - install-system-dependencies
+      - install-ruby:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
       - bundle-install:
           ruby-version: << pipeline.parameters.default-ruby-version >>
           cache-namespace: development
@@ -328,6 +368,8 @@ jobs:
     steps:
       - checkout
       - install-system-dependencies
+      - install-ruby:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
       - bundle-install:
           ruby-version: << pipeline.parameters.default-ruby-version >>
           cache-namespace: development
@@ -345,6 +387,8 @@ jobs:
     steps:
       - checkout
       - install-system-dependencies
+      - install-ruby:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
       - bundle-install:
           ruby-version: << pipeline.parameters.default-ruby-version >>
           cache-namespace: development
@@ -405,6 +449,8 @@ jobs:
     steps:
       - checkout
       - install-system-dependencies
+      - install-ruby:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
       - bundle-install:
           ruby-version: << pipeline.parameters.default-ruby-version >>
           cache-namespace: default
@@ -450,6 +496,8 @@ jobs:
     steps:
       - checkout
       - install-system-dependencies
+      - install-ruby:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
       - bundle-install:
           ruby-version: << pipeline.parameters.default-ruby-version >>
           cache-namespace: << parameters.mode >>
@@ -517,6 +565,8 @@ jobs:
       - restore-asset-artifacts
       - install-system-dependencies:
           additional-packages: ffmpeg libpam-dev
+      - install-ruby:
+          ruby-version: << parameters.ruby-version >>
       - bundle-install:
           ruby-version: << parameters.ruby-version >>
           cache-namespace: pam-test
@@ -593,6 +643,8 @@ jobs:
       - restore-asset-artifacts
       - install-system-dependencies:
           additional-packages: ffmpeg
+      - install-ruby:
+          ruby-version: << parameters.ruby-version >>
       - bundle-install:
           ruby-version: << parameters.ruby-version >>
           cache-namespace: test
@@ -657,6 +709,8 @@ jobs:
       - restore-asset-artifacts
       - install-system-dependencies:
           additional-packages: ffmpeg
+      - install-ruby:
+          ruby-version: << parameters.ruby-version >>
       - bundle-install:
           ruby-version: << parameters.ruby-version >>
           cache-namespace: test
@@ -697,6 +751,8 @@ jobs:
       - restore-asset-artifacts
       - install-system-dependencies:
           additional-packages: ffmpeg
+      - install-ruby:
+          ruby-version: << parameters.ruby-version >>
       - bundle-install:
           ruby-version: << parameters.ruby-version >>
           cache-namespace: test
@@ -735,6 +791,8 @@ jobs:
     steps:
       - checkout
       - install-system-dependencies
+      - install-ruby:
+          ruby-version: << pipeline.parameters.default-ruby-version >>
       - bundle-install:
           ruby-version: << pipeline.parameters.default-ruby-version >>
           cache-namespace: migrations
