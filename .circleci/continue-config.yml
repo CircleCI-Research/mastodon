@@ -98,7 +98,12 @@ executors:
           POSTGRES_USER: postgres
           POSTGRES_DB: postgres
       - image: redis:7-alpine
-    resource_class: large
+    # 16 GB, not large's 8. This job runs the Ruby container alongside its
+    # service containers and they share the job's memory: postgres:14-alpine
+    # was SIGKILLed at startup (exit 137) on `large`. GitHub gives service
+    # containers a 16 GB runner, and CircleCI classes match GitHub on cores
+    # but not on memory -- xlarge is the first class that reaches 16 GB.
+    resource_class: xlarge
 
   # As above, plus an Elasticsearch service container.
   ruby-with-elasticsearch:
@@ -119,7 +124,12 @@ executors:
         environment:
           discovery.type: single-node
           xpack.security.enabled: false
-    resource_class: large
+    # 16 GB, not large's 8. This job runs the Ruby container alongside its
+    # service containers and they share the job's memory: postgres:14-alpine
+    # was SIGKILLed at startup (exit 137) on `large`. GitHub gives service
+    # containers a 16 GB runner, and CircleCI classes match GitHub on cores
+    # but not on memory -- xlarge is the first class that reaches 16 GB.
+    resource_class: xlarge
 
   # As above, but OpenSearch, which rejects the `xpack.*` settings that
   # Elasticsearch requires -- hence a separate executor rather than one
@@ -143,7 +153,12 @@ executors:
           discovery.type: single-node
           DISABLE_INSTALL_DEMO_CONFIG: true
           DISABLE_SECURITY_PLUGIN: true
-    resource_class: large
+    # 16 GB, not large's 8. This job runs the Ruby container alongside its
+    # service containers and they share the job's memory: postgres:14-alpine
+    # was SIGKILLed at startup (exit 137) on `large`. GitHub gives service
+    # containers a 16 GB runner, and CircleCI classes match GitHub on cores
+    # but not on memory -- xlarge is the first class that reaches 16 GB.
+    resource_class: xlarge
 
   # Node only. Replaces `.github/actions/setup-javascript` on its own.
   node:
@@ -189,9 +204,12 @@ commands:
             # against a hardcoded prefix, so extracting anywhere else fails at
             # first use with "libruby.so.<version>: cannot open shared object
             # file". Use the exact prefix ruby/setup-ruby extracts to.
-            prefix="/opt/hostedtoolcache/Ruby/${FULL}/x64"
-            sudo mkdir -p "$prefix"
-            curl -fsSL "$url" | sudo tar -xz -C "$prefix"
+            # The tarball's own root directory is `x64/`, so it unpacks INTO
+            # the version directory, not into the x64 one.
+            root="/opt/hostedtoolcache/Ruby/${FULL}"
+            prefix="${root}/x64"
+            sudo mkdir -p "$root"
+            curl -fsSL "$url" | sudo tar -xz -C "$root"
             if [ ! -x "$prefix/bin/ruby" ]; then
               echo "no bin/ruby under $prefix after extraction"; exit 1
             fi
