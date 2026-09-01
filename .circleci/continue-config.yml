@@ -581,6 +581,14 @@ jobs:
       name: ruby-with-db
       ruby-version: << parameters.ruby-version >>
     environment:
+      # flatware defaults to Etc.nprocessors, which inside a Docker executor
+      # reports the HOST's core count, not the container's allocation. It
+      # spawned 36 workers on an 8-vCPU container and each worker takes its own
+      # Redis database, so workers 16+ died with "ERR DB index is out of range"
+      # -- Redis only has databases 0-15. On GitHub's 4-core runner the default
+      # lands at 4 and the problem never appears. Same root cause as sizing
+      # pytest with `-n auto`; pin it to the executor's real vCPU count.
+      FLATWARE_WORKERS: '8'
       DB_HOST: localhost
       DB_USER: postgres
       DB_PASS: postgres
@@ -610,7 +618,7 @@ jobs:
           name: Load database schema
           command: |
             bin/rails db:setup
-            bin/flatware fan bin/rails db:test:prepare
+            bin/flatware fan -w "$FLATWARE_WORKERS" bin/rails db:test:prepare
       - restore_cache:
           keys:
             - rspec-persistence-v1-<< parameters.ruby-version >>-{{ .Branch }}-{{ .Revision }}
@@ -619,7 +627,7 @@ jobs:
             - rspec-persistence-v1-<< parameters.ruby-version >>-
       - run:
           name: Run RSpec
-          command: bin/flatware rspec
+          command: bin/flatware rspec -w "$FLATWARE_WORKERS"
       - save_cache:
           key: rspec-persistence-v1-<< parameters.ruby-version >>-{{ .Branch }}-{{ .Revision }}
           paths:
