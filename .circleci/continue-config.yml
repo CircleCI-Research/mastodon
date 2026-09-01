@@ -434,6 +434,8 @@ jobs:
   # === .github/workflows/lint-js.yml : lint ================================
   lint-js:
     executor: node
+    environment:
+      NODE_OPTIONS: --max-old-space-size=4096
     steps:
       - checkout
       - setup-javascript
@@ -643,6 +645,10 @@ jobs:
                 # opts in, so the CLI is invoked directly.
                 # Requires CODECOV_TOKEN in the project environment.
                 command: |
+                  if [ -z "${CODECOV_TOKEN:-}" ]; then
+                    echo "CODECOV_TOKEN is not set; skipping Codecov upload."
+                    exit 0
+                  fi
                   codecov_files=()
                   for lcov in coverage/lcov/*.lcov; do
                     [ -e "$lcov" ] || continue
