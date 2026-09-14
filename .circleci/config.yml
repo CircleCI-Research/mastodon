@@ -1,0 +1,233 @@
+version: 2.1
+
+# No secrets/credentials are required to run this pipeline: every image
+# pulled below is public (cimg/*, redis, postgres) and no external service
+# (Code Climate, Codecov, etc.) is wired up. See the PR description / final
+# summary for what was intentionally left out.
+
+executors:
+  ruby:
+    docker:
+      - image: circleci/ruby:2.5.1
+    working_directory: ~/mastodon
+    resource_class: medium
+
+  ruby-large:
+    docker:
+      - image: circleci/ruby:2.5.1
+      - image: cimg/postgres:9.6
+        environment:
+          POSTGRES_USER: mastodon
+          POSTGRES_PASSWORD: ""
+          POSTGRES_DB: mastodon_test
+      - image: redis:4.0-alpine
+    working_directory: ~/mastodon
+    resource_class: large
+
+commands:
+  install_apt_deps:
+    description: "Install native library deps listed in Aptfile, plus libxml/libxslt for Nokogiri"
+    steps:
+      - run:
+          name: Install apt packages
+          command: |
+            sudo apt-get update
+            sudo apt-get install -y --no-install-recommends \
+              ffmpeg \
+              libicu-dev \
+              libidn11-dev \
+              libpq-dev \
+              libprotobuf-dev \
+              protobuf-compiler \
+              libxml2-dev \
+              libxslt1-dev
+
+  install_node:
+    description: "Install the exact Node version pinned in .nvmrc (6.x) and Yarn"
+    steps:
+      - run:
+          name: Install Node 6.17.1 (pinned by .nvmrc) and Yarn
+          command: |
+            if command -v node >/dev/null && [ "$(node -v)" = "v6.17.1" ]; then
+              exit 0
+            fi
+            curl -fsSL https://nodejs.org/dist/v6.17.1/node-v6.17.1-linux-x64.tar.xz -o /tmp/node.tar.xz
+            sudo tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1
+            sudo npm install -g yarn
+            node -v
+            yarn -v
+
+  restore_bundle_cache:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-bundle-{{ checksum "Gemfile.lock" }}-ruby2.5.1-circleci-legacy
+            - v1-bundle-ruby2.5.1-circleci-legacy-
+
+  restore_yarn_cache:
+    steps:
+      - restore_cache:
+          keys:
+            - v1-yarn-{{ checksum "yarn.lock" }}-node6.17.1
+            - v1-yarn-node6.17.1-
+
+jobs:
+  dependencies:
+    executor: ruby
+    steps:
+      - checkout
+      - install_apt_deps
+      - install_node
+      - restore_bundle_cache
+      - run:
+          name: bundle install
+          command: |
+            bundle config set --local path 'vendor/bundle'
+            bundle config set --local without 'development production'
+            bundle config set --local with 'pam_authentication'
+            bundle install --jobs=4 --retry=3
+          no_output_timeout: 15m
+      - save_cache:
+          key: v1-bundle-{{ checksum "Gemfile.lock" }}-ruby2.5.1-circleci-legacy
+          paths:
+            - vendor/bundle
+      - restore_yarn_cache
+      - run:
+          name: yarn install
+          command: yarn install --frozen-lockfile --cache-folder ~/.cache/yarn
+      - save_cache:
+          key: v1-yarn-{{ checksum "yarn.lock" }}-node6.17.1
+          paths:
+            - ~/.cache/yarn
+      - persist_to_workspace:
+          root: ~/mastodon
+          paths:
+            - vendor/bundle
+            - node_modules
+            - .bundle
+
+  rspec:
+    executor: ruby-large
+    environment:
+      RAILS_ENV: test
+      NOKOGIRI_USE_SYSTEM_LIBRARIES: "true"
+      ALLOW_NOPAM: "true"
+      LOCAL_DOMAIN: cb6e6126.ngrok.io
+      LOCAL_HTTPS: "true"
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_USER: mastodon
+      DB_PASS: ""
+      PARALLEL_TEST_PROCESSORS: "2"
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/mastodon
+      - install_apt_deps
+      - install_node
+      - run:
+          name: Wait for Postgres
+          command: |
+            for i in $(seq 1 30); do
+              (exec 3<>/dev/tcp/127.0.0.1/5432) 2>/dev/null && exit 0
+              sleep 1
+            done
+            echo "Postgres did not become reachable on 127.0.0.1:5432 within 30s"
+            exit 1
+      - run:
+          name: Create and load test databases, precompile assets
+          command: |
+            bundle exec rails parallel:create parallel:load_schema parallel:prepare assets:precompile
+          no_output_timeout: 15m
+      - run:
+          name: rspec (parallel_tests, 2 workers)
+          command: |
+            bundle exec parallel_test spec/ --group-by filesize --type rspec 2>&1 | tee /tmp/rspec-output.log
+          no_output_timeout: 15m
+      - run:
+          name: Verify the suite actually ran examples (guard against a silent 0-example pass)
+          command: |
+            total=$(grep -oE '[0-9]+ examples?' /tmp/rspec-output.log | awk '{s+=$1} END {print s+0}')
+            echo "Total examples run across all parallel workers: $total"
+            if [ "$total" -lt 100 ]; then
+              echo "Too few examples ran ($total) - suite likely didn't execute as expected."
+              exit 1
+            fi
+      - store_artifacts:
+          path: /tmp/rspec-output.log
+
+  jest:
+    executor: ruby
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/mastodon
+      - install_node
+      - run:
+          name: yarn test:jest
+          command: |
+            yarn run test:jest --ci 2>&1 | tee /tmp/jest-output.log
+      - run:
+          name: Verify jest actually ran tests
+          command: |
+            if grep -qE 'No tests found|0 total' /tmp/jest-output.log; then
+              echo "Jest reported zero tests - failing explicitly."
+              exit 1
+            fi
+      - store_artifacts:
+          path: /tmp/jest-output.log
+
+  eslint:
+    executor: ruby
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/mastodon
+      - install_node
+      - run:
+          name: yarn test:lint
+          command: yarn run test:lint
+
+  rubocop:
+    executor: ruby
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/mastodon
+      - run:
+          name: bundle exec rubocop
+          command: bundle exec rubocop
+
+  i18n-tasks:
+    executor: ruby
+    environment:
+      RAILS_ENV: test
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/mastodon
+      - run:
+          name: i18n-tasks check-normalized && unused
+          command: |
+            bundle exec i18n-tasks check-normalized
+            bundle exec i18n-tasks unused
+
+workflows:
+  test:
+    jobs:
+      - dependencies
+      - rspec:
+          requires:
+            - dependencies
+      - jest:
+          requires:
+            - dependencies
+      - eslint:
+          requires:
+            - dependencies
+      - rubocop:
+          requires:
+            - dependencies
+      - i18n-tasks:
+          requires:
+            - dependencies
