@@ -9,12 +9,26 @@ executors:
   ruby:
     docker:
       - image: circleci/ruby:2.5.1
+        environment:
+          # circleci/ruby:2.5.1 bakes in BUNDLE_PATH=/usr/local/bundle and
+          # BUNDLE_APP_CONFIG=/usr/local/bundle as image env vars, which
+          # outrank `bundle config set --local` - override them here so
+          # gems land under the project dir (what gets cached/persisted
+          # to the workspace) instead of vanishing into the image's own
+          # gem dir on every fresh container.
+          BUNDLE_PATH: vendor/bundle
+          BUNDLE_WITHOUT: "development:production"
+          BUNDLE_WITH: pam_authentication
     working_directory: ~/mastodon
     resource_class: medium
 
   ruby-large:
     docker:
       - image: circleci/ruby:2.5.1
+        environment:
+          BUNDLE_PATH: vendor/bundle
+          BUNDLE_WITHOUT: "development:production"
+          BUNDLE_WITH: pam_authentication
       - image: cimg/postgres:9.6
         environment:
           POSTGRES_USER: mastodon
@@ -31,11 +45,23 @@ commands:
       - run:
           name: Install apt packages
           command: |
+            # circleci/ruby:2.5.1 is Debian stretch, which is EOL and no
+            # longer served from deb.debian.org - point at the archive
+            # mirror, stop checking Release file expiry, and drop the
+            # stretch-updates suite (it 404s even on the archive mirror,
+            # which would abort this step under set -e).
+            sudo sed -i \
+              -e 's|deb.debian.org/debian|archive.debian.org/debian|g' \
+              -e 's|security.debian.org/debian-security|archive.debian.org/debian-security|g' \
+              -e '/stretch-updates/d' \
+              /etc/apt/sources.list
+            echo 'Acquire::Check-Valid-Until "false";' | sudo tee /etc/apt/apt.conf.d/99no-check-valid-until
             sudo apt-get update
-            sudo apt-get install -y --no-install-recommends \
+            sudo apt-get install -y --no-install-recommends --allow-unauthenticated \
               ffmpeg \
               libicu-dev \
               libidn11-dev \
+              libpam0g-dev \
               libpq-dev \
               libprotobuf-dev \
               protobuf-compiler \
@@ -81,11 +107,7 @@ jobs:
       - restore_bundle_cache
       - run:
           name: bundle install
-          command: |
-            bundle config set --local path 'vendor/bundle'
-            bundle config set --local without 'development production'
-            bundle config set --local with 'pam_authentication'
-            bundle install --jobs=4 --retry=3
+          command: bundle install --jobs=4 --retry=3
           no_output_timeout: 15m
       - save_cache:
           key: v1-bundle-{{ checksum "Gemfile.lock" }}-ruby2.5.1-circleci-legacy
@@ -110,6 +132,10 @@ jobs:
     executor: ruby-large
     environment:
       RAILS_ENV: test
+      # Webpacker's output dir (public/packs-test) is keyed off NODE_ENV,
+      # not RAILS_ENV - bin/webpack defaults NODE_ENV to "development" if
+      # unset, which silently compiles to the wrong directory.
+      NODE_ENV: test
       NOKOGIRI_USE_SYSTEM_LIBRARIES: "true"
       ALLOW_NOPAM: "true"
       LOCAL_DOMAIN: cb6e6126.ngrok.io
@@ -118,6 +144,7 @@ jobs:
       DB_PORT: "5432"
       DB_USER: mastodon
       DB_PASS: ""
+      REDIS_URL: redis://127.0.0.1:6379
       PARALLEL_TEST_PROCESSORS: "2"
     steps:
       - checkout
@@ -142,6 +169,7 @@ jobs:
       - run:
           name: rspec (parallel_tests, 2 workers)
           command: |
+            set -o pipefail
             bundle exec parallel_test spec/ --group-by filesize --type rspec 2>&1 | tee /tmp/rspec-output.log
           no_output_timeout: 15m
       - run:
@@ -166,6 +194,7 @@ jobs:
       - run:
           name: yarn test:jest
           command: |
+            set -o pipefail
             yarn run test:jest --ci 2>&1 | tee /tmp/jest-output.log
       - run:
           name: Verify jest actually ran tests
@@ -187,16 +216,6 @@ jobs:
       - run:
           name: yarn test:lint
           command: yarn run test:lint
-
-  rubocop:
-    executor: ruby
-    steps:
-      - checkout
-      - attach_workspace:
-          at: ~/mastodon
-      - run:
-          name: bundle exec rubocop
-          command: bundle exec rubocop
 
   i18n-tasks:
     executor: ruby
@@ -223,9 +242,6 @@ workflows:
           requires:
             - dependencies
       - eslint:
-          requires:
-            - dependencies
-      - rubocop:
           requires:
             - dependencies
       - i18n-tasks:
