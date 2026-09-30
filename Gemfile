@@ -131,6 +131,9 @@ group :test do
   # Adds RSpec Error/Warning annotations to GitHub PRs on the Files tab
   gem 'rspec-github', '~> 3.0', require: false
 
+  # JUnit XML output, so CI can ingest per-spec results
+  gem 'rspec_junit_formatter', require: false
+
   # Extra RSpec extension methods and helpers for sidekiq
   gem 'rspec-sidekiq', '~> 5.0'
 

@@ -37,6 +37,12 @@ RSpec.configure do |config|
     require 'rspec/github'
     config.add_formatter RSpec::Github::Formatter
   end
+
+  # JUnit XML for CI test insights; set to the output path to enable
+  if ENV['RSPEC_JUNIT_OUTPUT'].present?
+    require 'rspec_junit_formatter'
+    config.add_formatter RspecJunitFormatter, ENV.fetch('RSPEC_JUNIT_OUTPUT')
+  end
 end
 
 def serialized_record_json(record, serializer, adapter: nil, options: {})

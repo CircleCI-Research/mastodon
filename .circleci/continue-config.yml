@@ -166,6 +166,13 @@ executors:
       - image: cimg/node:<< pipeline.parameters.node-version >>
     resource_class: large
 
+  # For the light Node-only jobs (css lint, format), which finish in under 40s.
+  # Not lint-js: it needs more than medium's 4 GB (see its NODE_OPTIONS).
+  node-medium:
+    docker:
+      - image: cimg/node:<< pipeline.parameters.node-version >>
+    resource_class: medium
+
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
@@ -300,12 +307,13 @@ commands:
     steps:
       - run:
           name: Enable corepack
-          # Upstream runs a bare `npm i -g corepack`. Whether that needs sudo
+          # Upstream runs a bare `npm i -g corepack`; pinned here so a new
+          # corepack release cannot change a run. Whether that needs sudo
           # depends on how Node was installed in the image (nvm-owned prefix
           # vs. /usr/local), which differs between cimg/node and
           # cimg/ruby:*-node, so both are attempted.
           command: |
-            npm i -g corepack@latest || sudo npm i -g corepack@latest
+            npm i -g corepack@0.36.0 || sudo npm i -g corepack@0.36.0
             corepack enable || sudo corepack enable
             yarn --version
       - restore_cache:
@@ -448,7 +456,7 @@ jobs:
 
   # === .github/workflows/lint-css.yml : lint ===============================
   lint-css:
-    executor: node
+    executor: node-medium
     steps:
       - checkout
       - setup-javascript
@@ -458,7 +466,7 @@ jobs:
 
   # === .github/workflows/format-check.yml : lint ===========================
   format-check:
-    executor: node
+    executor: node-medium
     steps:
       - checkout
       - setup-javascript
@@ -474,7 +482,13 @@ jobs:
       - setup-javascript
       - run:
           name: JavaScript testing
-          command: yarn test:js
+          command: >-
+            yarn test:js
+            --reporter=default --reporter=junit
+            --outputFile.junit=test-results/vitest/results.xml
+      - store_test_results:
+          path: test-results
+          when: always
 
   # === .github/workflows/check-i18n.yml : check-i18n =======================
   check-i18n:
@@ -591,6 +605,7 @@ jobs:
       # lands at 4 and the problem never appears. Same root cause as sizing
       # pytest with `-n auto`; pin it to the executor's real vCPU count.
       FLATWARE_WORKERS: '8'
+      RSPEC_JUNIT_OUTPUT: test-results/rspec/test-ruby-<< parameters.ruby-version >>.xml
       DB_HOST: localhost
       DB_USER: postgres
       DB_PASS: postgres
@@ -634,6 +649,9 @@ jobs:
           key: rspec-persistence-v1-<< parameters.ruby-version >>-{{ .Branch }}-{{ .Revision }}
           paths:
             - tmp/rspec/examples.txt
+      - store_test_results:
+          path: test-results
+          when: always
       - when:
           condition:
             equal: ['true', << parameters.coverage >>]
@@ -687,6 +705,7 @@ jobs:
       BUNDLE_WITH: test
       LOCAL_DOMAIN: localhost:3000
       LOCAL_HTTPS: false
+      RSPEC_JUNIT_OUTPUT: test-results/rspec/test-e2e-<< parameters.ruby-version >>.xml
     steps:
       - checkout
       - restore-asset-artifacts
@@ -723,6 +742,9 @@ jobs:
       - run:
           name: Run end-to-end tests
           command: bin/rspec spec/system --tag streaming --tag js
+      - store_test_results:
+          path: test-results
+          when: always
       # Upstream guards both uploads with `if: failure()`.
       - store_artifacts:
           path: log
@@ -753,6 +775,7 @@ jobs:
       ES_ENABLED: true
       ES_HOST: localhost
       ES_PORT: 9200
+      RSPEC_JUNIT_OUTPUT: test-results/rspec/test-search-<< parameters.ruby-version >>.xml
     steps:
       - checkout
       - restore-asset-artifacts
@@ -771,6 +794,9 @@ jobs:
       - run:
           name: Run search integration tests
           command: bin/rspec --tag search
+      - store_test_results:
+          path: test-results
+          when: always
       - store_artifacts:
           path: log
           destination: test-search-logs-<< parameters.ruby-version >>
@@ -795,6 +821,7 @@ jobs:
       ES_ENABLED: true
       ES_HOST: localhost
       ES_PORT: 9200
+      RSPEC_JUNIT_OUTPUT: test-results/rspec/test-search-<< parameters.ruby-version >>.xml
     steps:
       - checkout
       - restore-asset-artifacts
@@ -813,6 +840,9 @@ jobs:
       - run:
           name: Run search integration tests
           command: bin/rspec --tag search
+      - store_test_results:
+          path: test-results
+          when: always
       - store_artifacts:
           path: log
           destination: test-search-logs-<< parameters.ruby-version >>
