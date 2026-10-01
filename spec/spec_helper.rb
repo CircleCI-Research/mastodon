@@ -39,7 +39,8 @@ RSpec.configure do |config|
   end
 
   # JUnit XML for CI test insights; set to the output path to enable
-  if ENV['RSPEC_JUNIT_OUTPUT'].present?
+  # (plain Ruby: ActiveSupport is not loaded yet at this point)
+  unless ENV.fetch('RSPEC_JUNIT_OUTPUT', '').empty?
     require 'rspec_junit_formatter'
     config.add_formatter RspecJunitFormatter, ENV.fetch('RSPEC_JUNIT_OUTPUT')
   end
